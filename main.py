@@ -4,6 +4,7 @@ import requests
 from shapely.geometry import Polygon, Point
 from shapely.ops import transform
 from pyproj import Transformer
+import time
 
 app = FastAPI()
 
@@ -24,6 +25,70 @@ def calculate_area_sqft(coords):
     projected_polygon = transform(transformer.transform, polygon)
     area_m2 = projected_polygon.area
     return area_m2 * 10.7639
+
+
+def geocode_address(address):
+    geo_url = "https://nominatim.openstreetmap.org/search"
+
+    geo_params = {
+        "q": address,
+        "format": "json",
+        "limit": 1,
+        "countrycodes": "us",
+        "addressdetails": 1
+    }
+
+    headers = {"User-Agent": "sierra-roof-estimator"}
+
+    for attempt in range(2):  # retry once
+        try:
+            response = requests.get(
+                geo_url,
+                params=geo_params,
+                headers=headers,
+                timeout=10
+            ).json()
+
+            if response:
+                return response[0]
+        except:
+            pass
+
+        time.sleep(1)
+
+    return None
+
+
+def get_buildings(lat, lon):
+    overpass_url = "https://overpass-api.de/api/interpreter"
+
+    # Try progressively larger radius
+    for radius in [75, 150, 250]:
+
+        overpass_query = f"""
+        [out:json][timeout:25];
+        way(around:{radius},{lat},{lon})["building"];
+        out geom;
+        """
+
+        try:
+            response = requests.post(
+                overpass_url,
+                data=overpass_query,
+                timeout=30
+            ).json()
+
+            elements = response.get("elements", [])
+
+            if elements:
+                return elements
+
+        except:
+            pass
+
+        time.sleep(1)
+
+    return []
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -65,13 +130,12 @@ def home():
                     cursor:pointer;
                 }
                 button:hover { background:#162d6b; }
-                small { color:#666; }
             </style>
         </head>
         <body>
             <div class="container">
                 <h1>Sierra Exteriors Roof Estimator</h1>
-                <small>Supports Illinois & Wisconsin properties</small>
+                <p>Supports Illinois & Wisconsin</p>
                 <form action="/calculate" method="get">
                     <input type="text" name="address"
                         placeholder="Enter property address"
@@ -94,64 +158,33 @@ def home():
 def calculate(address: str, pitch: str):
     try:
 
-        # --- STEP 1: GEOCODE ---
-        geo_url = "https://nominatim.openstreetmap.org/search"
-        geo_params = {
-            "q": address,
-            "format": "json",
-            "limit": 1,
-            "countrycodes": "us"
-        }
-        headers = {"User-Agent": "sierra-roof-estimator"}
+        geo_data = geocode_address(address)
 
-        geo_response = requests.get(
-            geo_url,
-            params=geo_params,
-            headers=headers,
-            timeout=10
-        ).json()
-
-        if not geo_response:
+        if not geo_data:
             return """
-            <h2 style='font-family:Arial;text-align:center;margin-top:100px;'>
-            Address not found. Please try full street name and state.
+            <h2 style='text-align:center;margin-top:100px;'>
+            Address not found. Try full street name and state.
             </h2>
             """
 
-        lat = float(geo_response[0]["lat"])
-        lon = float(geo_response[0]["lon"])
-        display_name = geo_response[0].get("display_name", "")
+        lat = float(geo_data["lat"])
+        lon = float(geo_data["lon"])
+        display_name = geo_data.get("display_name", "")
 
-        # Restrict to Illinois & Wisconsin
         if not ("Illinois" in display_name or "Wisconsin" in display_name):
             return """
-            <h2 style='font-family:Arial;text-align:center;margin-top:100px;'>
-            This estimator currently supports Illinois and Wisconsin only.
+            <h2 style='text-align:center;margin-top:100px;'>
+            Only Illinois and Wisconsin addresses supported.
             </h2>
             """
 
-        # --- STEP 2: GET BUILDING FOOTPRINT ---
-        overpass_query = f"""
-        [out:json];
-        way(around:100,{lat},{lon})["building"];
-        out geom;
-        """
-
-        overpass_url = "https://overpass-api.de/api/interpreter"
-
-        osm_response = requests.post(
-            overpass_url,
-            data=overpass_query,
-            timeout=20
-        ).json()
-
-        elements = osm_response.get("elements", [])
+        elements = get_buildings(lat, lon)
 
         if not elements:
             return """
-            <h2 style='font-family:Arial;text-align:center;margin-top:100px;'>
-            We could not automatically detect this building.
-            Please request a manual inspection.
+            <h2 style='text-align:center;margin-top:100px;'>
+            Could not detect building footprint.
+            Please request manual inspection.
             </h2>
             """
 
@@ -161,7 +194,14 @@ def calculate(address: str, pitch: str):
         min_distance = float("inf")
 
         for element in elements:
+            if "geometry" not in element:
+                continue
+
             coords = [(node["lon"], node["lat"]) for node in element["geometry"]]
+
+            if len(coords) < 3:
+                continue
+
             polygon = Polygon(coords)
             distance = polygon.distance(point)
 
@@ -171,8 +211,16 @@ def calculate(address: str, pitch: str):
 
         if closest_polygon is None:
             return """
-            <h2 style='font-family:Arial;text-align:center;margin-top:100px;'>
+            <h2 style='text-align:center;margin-top:100px;'>
             Could not match building footprint.
+            </h2>
+            """
+
+        # ignore buildings too far away
+        if min_distance > 0.001:
+            return """
+            <h2 style='text-align:center;margin-top:100px;'>
+            Building too far from address point.
             </h2>
             """
 
@@ -181,14 +229,11 @@ def calculate(address: str, pitch: str):
         )
 
         multiplier = PITCH_MULTIPLIERS.get(pitch, 1.12)
-
-        roof_area = footprint_sqft * multiplier
-        roof_area *= 1.10  # waste
+        roof_area = footprint_sqft * multiplier * 1.10
 
         low_estimate = roof_area * LOW_RATE
         high_estimate = roof_area * HIGH_RATE
 
-        # --- RESULT PAGE ---
         return f"""
         <html>
         <body style="font-family:Arial;background:#f4f6f9;text-align:center;padding:50px;">
@@ -197,7 +242,7 @@ def calculate(address: str, pitch: str):
                 <h1 style="color:#1e3a8a;">Roof Estimate Result</h1>
                 <p><strong>Address:</strong> {address}</p>
                 <p><strong>Roof Pitch:</strong> {pitch}</p>
-                <p><strong>Roof Area:</strong> {round(roof_area,0):,} sq ft (incl. 10% waste)</p>
+                <p><strong>Roof Area:</strong> {round(roof_area,0):,} sq ft</p>
                 <p><strong>Estimated Cost Range:</strong>
                 ${round(low_estimate,0):,} – ${round(high_estimate,0):,}</p>
                 <p><em>Final pricing confirmed after inspection.</em></p>
@@ -211,7 +256,7 @@ def calculate(address: str, pitch: str):
     except Exception as e:
         print("ERROR:", e)
         return """
-        <h2 style='font-family:Arial;text-align:center;margin-top:100px;'>
+        <h2 style='text-align:center;margin-top:100px;'>
         Something went wrong. Please try again.
         </h2>
         """
